@@ -4,30 +4,22 @@ Flask + MySQL integration with signup, login, profile management, and grades dis
 """
 
 import os
+import sqlite3
 from functools import wraps
 from flask import Flask, render_template, request, redirect, url_for, flash, session
-from flask_mysqldb import MySQL
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
 
-# Load config from config.py if available, else use env/defaults
+# Load config from config.py if available
 try:
-    from config import MYSQL_HOST, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DB, MYSQL_PORT, SECRET_KEY
+    from config import DB_PATH, SECRET_KEY
     app.config['SECRET_KEY'] = SECRET_KEY
-    app.config['MYSQL_HOST'] = MYSQL_HOST
-    app.config['MYSQL_USER'] = MYSQL_USER
-    app.config['MYSQL_PASSWORD'] = MYSQL_PASSWORD
-    app.config['MYSQL_DB'] = MYSQL_DB
-    app.config['MYSQL_PORT'] = MYSQL_PORT
+    app.config['DB_PATH'] = DB_PATH
 except ImportError:
     app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-key-change-in-production')
-    app.config['MYSQL_HOST'] = os.environ.get('MYSQL_HOST', 'localhost')
-    app.config['MYSQL_USER'] = os.environ.get('MYSQL_USER', 'root')
-    app.config['MYSQL_PASSWORD'] = os.environ.get('MYSQL_PASSWORD', '')
-    app.config['MYSQL_DB'] = os.environ.get('MYSQL_DB', 'user_auth_db')
-    app.config['MYSQL_PORT'] = int(os.environ.get('MYSQL_PORT', 3306))
+    app.config['DB_PATH'] = os.environ.get('DB_PATH', os.path.join(os.path.dirname(__file__), 'user_auth.db'))
 
 # Upload folder for document sharing
 app.config['UPLOAD_FOLDER'] = os.path.join(os.path.dirname(__file__), 'uploads')
@@ -36,7 +28,74 @@ ALLOWED_EXTENSIONS = {'pdf', 'doc', 'docx', 'txt', 'xlsx', 'xls'}
 
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
-mysql = MySQL(app)
+
+# ============================================
+# SQLite Database Helper Functions
+# ============================================
+
+def get_db():
+    """Get SQLite database connection."""
+    conn = sqlite3.connect(app.config['DB_PATH'])
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    """Initialize database tables if they don't exist."""
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    # Users table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username VARCHAR(50) UNIQUE NOT NULL,
+            email VARCHAR(100) UNIQUE NOT NULL,
+            password VARCHAR(255) NOT NULL,
+            full_name VARCHAR(100),
+            phone VARCHAR(20),
+            address TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Grades table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS grades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            subject VARCHAR(100) NOT NULL,
+            marks REAL NOT NULL,
+            max_marks REAL DEFAULT 100,
+            grade VARCHAR(10),
+            semester VARCHAR(20),
+            academic_year VARCHAR(20),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        )
+    ''')
+    
+    # Shared documents table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS shared_documents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            title VARCHAR(200) NOT NULL,
+            filename VARCHAR(255) NOT NULL,
+            file_path VARCHAR(500) NOT NULL,
+            shared_with TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        )
+    ''')
+    
+    conn.commit()
+    conn.close()
+
+
+# Initialize database on startup
+init_db()
 
 
 def login_required(f):
@@ -78,15 +137,16 @@ def login():
             flash('Please enter both username and password.', 'danger')
             return render_template('login.html')
 
-        cur = mysql.connection.cursor()
-        cur.execute("SELECT id, username, password, full_name FROM users WHERE username = %s", (username,))
-        user = cur.fetchone()
-        cur.close()
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, username, password, full_name FROM users WHERE username = ?", (username,))
+        user = cursor.fetchone()
+        conn.close()
 
-        if user and check_password_hash(user[2], password):
-            session['user_id'] = user[0]
-            session['username'] = user[1]
-            session['full_name'] = user[3] or user[1]
+        if user and check_password_hash(user['password'], password):
+            session['user_id'] = user['id']
+            session['username'] = user['username']
+            session['full_name'] = user['full_name'] or user['username']
             flash(f'Welcome back, {session["full_name"]}!', 'success')
             return redirect(url_for('dashboard'))
         else:
@@ -124,18 +184,18 @@ def signup():
 
         hashed = generate_password_hash(password, method='scrypt')
 
-        cur = mysql.connection.cursor()
+        conn = get_db()
+        cursor = conn.cursor()
         try:
-            cur.execute(
-                "INSERT INTO users (username, email, password, full_name) VALUES (%s, %s, %s, %s)",
+            cursor.execute(
+                "INSERT INTO users (username, email, password, full_name) VALUES (?, ?, ?, ?)",
                 (username, email, hashed, full_name or username)
             )
-            mysql.connection.commit()
+            conn.commit()
             flash('Account created successfully! Please log in.', 'success')
             return redirect(url_for('login'))
-        except Exception as e:
-            mysql.connection.rollback()
-            if 'Duplicate' in str(e) or 'username' in str(e).lower():
+        except sqlite3.IntegrityError as e:
+            if 'username' in str(e).lower():
                 flash('Username already exists.', 'danger')
             elif 'email' in str(e).lower():
                 flash('Email already registered.', 'danger')
@@ -143,7 +203,7 @@ def signup():
                 flash(f'Registration failed: {str(e)}', 'danger')
             return render_template('signup.html')
         finally:
-            cur.close()
+            conn.close()
 
     return render_template('signup.html')
 
@@ -175,15 +235,16 @@ def dashboard():
 @login_required
 def profile():
     """View and update personal details."""
-    cur = mysql.connection.cursor()
-    cur.execute(
-        "SELECT username, email, full_name, phone, address FROM users WHERE id = %s",
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT username, email, full_name, phone, address FROM users WHERE id = ?",
         (session['user_id'],)
     )
-    user = cur.fetchone()
-    cur.close()
+    user = cursor.fetchone()
 
     if not user:
+        conn.close()
         flash('User not found.', 'danger')
         return redirect(url_for('dashboard'))
 
@@ -192,24 +253,24 @@ def profile():
         phone = request.form.get('phone', '').strip()
         address = request.form.get('address', '').strip()
 
-        cur = mysql.connection.cursor()
-        cur.execute(
-            "UPDATE users SET full_name = %s, phone = %s, address = %s WHERE id = %s",
+        cursor.execute(
+            "UPDATE users SET full_name = ?, phone = ?, address = ? WHERE id = ?",
             (full_name, phone, address, session['user_id'])
         )
-        mysql.connection.commit()
-        cur.close()
+        conn.commit()
+        conn.close()
 
         session['full_name'] = full_name or session['username']
         flash('Profile updated successfully!', 'success')
         return redirect(url_for('profile'))
 
+    conn.close()
     return render_template('profile.html', user={
-        'username': user[0],
-        'email': user[1],
-        'full_name': user[2] or '',
-        'phone': user[3] or '',
-        'address': user[4] or '',
+        'username': user['username'],
+        'email': user['email'],
+        'full_name': user['full_name'] or '',
+        'phone': user['phone'] or '',
+        'address': user['address'] or '',
     })
 
 
@@ -222,28 +283,30 @@ def reset_password():
         new_password = request.form.get('new_password', '')
         confirm_password = request.form.get('confirm_password', '')
 
-        cur = mysql.connection.cursor()
-        cur.execute("SELECT password FROM users WHERE id = %s", (session['user_id'],))
-        row = cur.fetchone()
-        cur.close()
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute("SELECT password FROM users WHERE id = ?", (session['user_id'],))
+        row = cursor.fetchone()
 
-        if not row or not check_password_hash(row[0], current_password):
+        if not row or not check_password_hash(row['password'], current_password):
+            conn.close()
             flash('Current password is incorrect.', 'danger')
             return render_template('reset_password.html')
 
         if len(new_password) < 6:
+            conn.close()
             flash('New password must be at least 6 characters.', 'danger')
             return render_template('reset_password.html')
 
         if new_password != confirm_password:
+            conn.close()
             flash('New passwords do not match.', 'danger')
             return render_template('reset_password.html')
 
         hashed = generate_password_hash(new_password, method='scrypt')
-        cur = mysql.connection.cursor()
-        cur.execute("UPDATE users SET password = %s WHERE id = %s", (hashed, session['user_id']))
-        mysql.connection.commit()
-        cur.close()
+        cursor.execute("UPDATE users SET password = ? WHERE id = ?", (hashed, session['user_id']))
+        conn.commit()
+        conn.close()
 
         flash('Password updated successfully!', 'success')
         return redirect(url_for('profile'))
@@ -259,23 +322,24 @@ def reset_password():
 @login_required
 def grades():
     """Display user grades (read-only)."""
-    cur = mysql.connection.cursor()
-    cur.execute(
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute(
         """SELECT subject, marks, max_marks, grade, semester, academic_year 
-           FROM grades WHERE user_id = %s ORDER BY semester, subject""",
+           FROM grades WHERE user_id = ? ORDER BY semester, subject""",
         (session['user_id'],)
     )
-    grades_list = cur.fetchall()
-    cur.close()
+    grades_list = cursor.fetchall()
+    conn.close()
 
     grades_data = [
         {
-            'subject': row[0],
-            'marks': float(row[1]),
-            'max_marks': float(row[2]),
-            'grade': row[3] or '-',
-            'semester': row[4] or '-',
-            'academic_year': row[5] or '-',
+            'subject': row['subject'],
+            'marks': float(row['marks']),
+            'max_marks': float(row['max_marks']),
+            'grade': row['grade'] or '-',
+            'semester': row['semester'] or '-',
+            'academic_year': row['academic_year'] or '-',
         }
         for row in grades_list
     ]
@@ -308,13 +372,14 @@ def documents():
             filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
             file.save(filepath)
 
-            cur = mysql.connection.cursor()
-            cur.execute(
-                "INSERT INTO shared_documents (user_id, title, filename, file_path) VALUES (%s, %s, %s, %s)",
+            conn = get_db()
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO shared_documents (user_id, title, filename, file_path) VALUES (?, ?, ?, ?)",
                 (session['user_id'], title, filename, filepath)
             )
-            mysql.connection.commit()
-            cur.close()
+            conn.commit()
+            conn.close()
 
             flash(f'Document "{title}" uploaded successfully!', 'success')
         else:
@@ -322,16 +387,17 @@ def documents():
 
         return redirect(url_for('documents'))
 
-    cur = mysql.connection.cursor()
-    cur.execute(
-        "SELECT id, title, filename, created_at FROM shared_documents WHERE user_id = %s ORDER BY created_at DESC",
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT id, title, filename, created_at FROM shared_documents WHERE user_id = ? ORDER BY created_at DESC",
         (session['user_id'],)
     )
-    docs = cur.fetchall()
-    cur.close()
+    docs = cursor.fetchall()
+    conn.close()
 
     documents_list = [
-        {'id': d[0], 'title': d[1], 'filename': d[2], 'created_at': str(d[3])}
+        {'id': d['id'], 'title': d['title'], 'filename': d['filename'], 'created_at': str(d['created_at'])}
         for d in docs
     ]
 
@@ -346,12 +412,13 @@ def documents():
 @login_required
 def add_sample_grades():
     """Add sample grades for testing - only if user has none."""
-    cur = mysql.connection.cursor()
-    cur.execute("SELECT COUNT(*) FROM grades WHERE user_id = %s", (session['user_id'],))
-    count = cur.fetchone()[0]
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) as count FROM grades WHERE user_id = ?", (session['user_id'],))
+    count = cursor.fetchone()['count']
     if count > 0:
+        conn.close()
         flash('You already have grades. Sample grades not added.', 'info')
-        cur.close()
         return redirect(url_for('grades'))
 
     sample = [
@@ -360,12 +427,12 @@ def add_sample_grades():
         (session['user_id'], 'Computer Science', 92, 100, 'A+', '1', '2024-25'),
         (session['user_id'], 'English', 88, 100, 'A', '1', '2024-25'),
     ]
-    cur.executemany(
-        "INSERT INTO grades (user_id, subject, marks, max_marks, grade, semester, academic_year) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+    cursor.executemany(
+        "INSERT INTO grades (user_id, subject, marks, max_marks, grade, semester, academic_year) VALUES (?, ?, ?, ?, ?, ?, ?)",
         sample
     )
-    mysql.connection.commit()
-    cur.close()
+    conn.commit()
+    conn.close()
     flash('Sample grades added. View them in the Grades section.', 'success')
     return redirect(url_for('grades'))
 

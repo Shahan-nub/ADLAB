@@ -1,11 +1,9 @@
 """Database configuration for User Authentication App."""
 
-# MySQL Configuration - Update these values for your MySQL setup
-MYSQL_HOST = 'localhost'
-MYSQL_USER = 'root'
-MYSQL_PASSWORD = ''  # Set your MySQL password here
-MYSQL_DB = 'user_auth_db'
-MYSQL_PORT = 3306
+import os
+
+# SQLite Configuration - File-based database (no password needed)
+DB_PATH = os.path.join(os.path.dirname(__file__), 'user_auth.db')
 
 # Flask secret key for session management
 SECRET_KEY = 'your-secret-key-change-in-production'
